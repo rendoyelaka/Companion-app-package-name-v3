@@ -42,28 +42,25 @@ jobs:
             echo "::error::${{ env.APK_NAME }} not found in repo root."
             exit 1
           fi
-          echo "✅ Found: ${{ env.APK_NAME }}"
+          ls -lh "${{ env.APK_NAME }}"
 
-      # ── 4. Extract SDK/version info before decompile ───────────────────────
+      # ── 4. Extract APK metadata ────────────────────────────────────────────
       - name: Extract APK metadata
         id: meta
         run: |
           INFO=$(aapt dump badging "${{ env.APK_NAME }}" 2>/dev/null | head -5)
           echo "$INFO"
-
           MIN_SDK=$(echo "$INFO" | grep -oP "(?<=minSdkVersion:')[0-9]+" || echo "28")
           TGT_SDK=$(echo "$INFO" | grep -oP "(?<=targetSdkVersion:')[0-9]+" || echo "33")
           VER_CODE=$(echo "$INFO" | grep -oP "(?<=versionCode=')[0-9]+" || echo "1")
           VER_NAME=$(echo "$INFO" | grep -oP "(?<=versionName=')[^']+" || echo "1.0")
-
           echo "min_sdk=$MIN_SDK"   >> $GITHUB_OUTPUT
           echo "tgt_sdk=$TGT_SDK"   >> $GITHUB_OUTPUT
           echo "ver_code=$VER_CODE" >> $GITHUB_OUTPUT
           echo "ver_name=$VER_NAME" >> $GITHUB_OUTPUT
-
           echo "✅ min=$MIN_SDK target=$TGT_SDK code=$VER_CODE name=$VER_NAME"
 
-      # ── 5. Decompile (no resource recompile) ──────────────────────────────
+      # ── 5. Decompile APK ───────────────────────────────────────────────────
       - name: Decompile APK
         run: |
           apktool d "${{ env.APK_NAME }}" \
@@ -78,30 +75,19 @@ jobs:
         run: |
           OLD="${{ env.OLD_PKG }}"
           NEW="${{ env.NEW_PKG }}"
-
-          echo "Renaming: $OLD → $NEW"
-
-          # AndroidManifest.xml
           sed -i "s|${OLD}|${NEW}|g" decompiled/AndroidManifest.xml
-
-          # FileProvider authority
           sed -i "s|${OLD}\.verapp\.provider|${NEW}.verapp.provider|g" \
             decompiled/AndroidManifest.xml
-
-          # smali files
           find decompiled/ -name "*.smali" \
             -exec sed -i "s|${OLD//.//}|${NEW//.//}|g" {} +
-
-          echo "✅ Rename done"
-
           grep -q "$NEW" decompiled/AndroidManifest.xml || \
             { echo "::error::New package not found."; exit 1; }
           grep -q "$OLD" decompiled/AndroidManifest.xml && \
             { echo "::error::Old package still present."; exit 1; }
-          echo "✅ Verified"
+          echo "✅ Rename verified"
 
-      # ── 7. Restore apktool.yml with correct metadata ───────────────────────
-      - name: Restore apktool.yml metadata
+      # ── 7. Restore apktool.yml ─────────────────────────────────────────────
+      - name: Restore apktool.yml
         run: |
           cat > decompiled/apktool.yml << EOF
           version: 2.9.3
@@ -127,7 +113,6 @@ jobs:
           - resources.arsc
           EOF
           echo "✅ apktool.yml restored"
-          cat decompiled/apktool.yml
 
       # ── 8. Repackage ──────────────────────────────────────────────────────
       - name: Repackage APK
@@ -136,13 +121,12 @@ jobs:
             -o renamed_unsigned.apk \
             --no-res \
             2>&1 | tee repackage.log
-
           if [ ! -f renamed_unsigned.apk ]; then
             echo "::error::Repackage failed."
             exit 1
           fi
-          echo "✅ Repackage done"
           ls -lh renamed_unsigned.apk
+          echo "✅ Repackage done"
 
       # ── 9. Generate debug keystore ─────────────────────────────────────────
       - name: Generate debug keystore
@@ -153,13 +137,18 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass android -keypass android \
             -dname "CN=Android Debug,O=Android,C=US" \
-            -noprompt
+            -noprompt 2>&1 | tee keystore.log
           echo "✅ Keystore ready"
 
       # ── 10. Zipalign ──────────────────────────────────────────────────────
       - name: Zipalign APK
         run: |
-          zipalign -v 4 renamed_unsigned.apk renamed_aligned.apk
+          zipalign -v 4 renamed_unsigned.apk renamed_aligned.apk 2>&1 | tee zipalign.log
+          if [ ! -f renamed_aligned.apk ]; then
+            echo "::error::Zipalign failed."
+            exit 1
+          fi
+          ls -lh renamed_aligned.apk
           echo "✅ Zipalign done"
 
       # ── 11. Sign APK ──────────────────────────────────────────────────────
@@ -171,14 +160,18 @@ jobs:
             --ks-pass pass:android \
             --key-pass pass:android \
             --out companion_renamed.apk \
-            renamed_aligned.apk
-          echo "✅ APK signed"
+            renamed_aligned.apk 2>&1 | tee apksigner.log
+          if [ ! -f companion_renamed.apk ]; then
+            echo "::error::Signing failed."
+            exit 1
+          fi
           ls -lh companion_renamed.apk
+          echo "✅ APK signed"
 
       # ── 12. Verify signature ──────────────────────────────────────────────
       - name: Verify APK signature
         run: |
-          apksigner verify --verbose companion_renamed.apk
+          apksigner verify --verbose companion_renamed.apk 2>&1 | tee verify.log
           echo "✅ Signature verified"
 
       # ── 13. Upload APK ────────────────────────────────────────────────────
@@ -190,13 +183,14 @@ jobs:
           path: companion_renamed.apk
           retention-days: 7
 
-      # ── 14. Collect error logs on failure ─────────────────────────────────
+      # ── 14. Collect ALL logs on failure ───────────────────────────────────
       - name: Collect error logs
         if: failure()
         run: |
           mkdir -p error_logs
-          [ -f decompile.log ]  && cp decompile.log  error_logs/
-          [ -f repackage.log ]  && cp repackage.log  error_logs/
+          for f in decompile.log repackage.log keystore.log zipalign.log apksigner.log verify.log; do
+            [ -f "$f" ] && cp "$f" error_logs/
+          done
           [ -f decompiled/AndroidManifest.xml ] && \
             cp decompiled/AndroidManifest.xml error_logs/
           [ -f decompiled/apktool.yml ] && \
@@ -204,6 +198,8 @@ jobs:
           {
             echo "=== OLD ===" && echo "${{ env.OLD_PKG }}"
             echo "=== NEW ===" && echo "${{ env.NEW_PKG }}"
+            echo "=== FILES ==="
+            ls -lh renamed_unsigned.apk renamed_aligned.apk companion_renamed.apk 2>&1 || true
             echo "=== APK ===" && ls -lh "${{ env.APK_NAME }}" 2>&1 || true
             echo "=== APKTOOL ===" && apktool --version 2>&1 || true
             echo "=== JAVA ===" && java -version 2>&1 || true
