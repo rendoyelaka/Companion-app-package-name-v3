@@ -1,0 +1,217 @@
+name: Rename Package & Build APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  rename-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up JDK ──────────────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ── 3. Cache Gradle ────────────────────────────────────────────────────
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      # ── 4. Auto-detect old package name ────────────────────────────────────
+      - name: Detect current package name
+        id: detect
+        run: |
+          OLD=""
+
+          # Try Groovy DSL
+          if [ -f "app/build.gradle" ]; then
+            OLD=$(grep -m1 'applicationId' app/build.gradle \
+                  | grep -oP '(?<=applicationId ")[^"]+' || true)
+          fi
+
+          # Try Kotlin DSL
+          if [ -z "$OLD" ] && [ -f "app/build.gradle.kts" ]; then
+            OLD=$(grep -m1 'applicationId' app/build.gradle.kts \
+                  | grep -oP '(?<=applicationId = ")[^"]+' || true)
+          fi
+
+          # Fallback: AndroidManifest.xml
+          if [ -z "$OLD" ]; then
+            OLD=$(grep -m1 'package=' app/src/main/AndroidManifest.xml \
+                  | grep -oP '(?<=package=")[^"]+' || true)
+          fi
+
+          if [ -z "$OLD" ]; then
+            echo "::error::Could not auto-detect package name."
+            exit 1
+          fi
+
+          echo "Detected old package: $OLD"
+          echo "old_package=$OLD" >> $GITHUB_OUTPUT
+
+      # ── 5. Generate new package name ───────────────────────────────────────
+      - name: Generate new package name
+        id: generate
+        run: |
+          OLD="${{ steps.detect.outputs.old_package }}"
+
+          # Strip reserved 'android' prefix if present (e.g. com.android.xyz → com.xyz)
+          # Then build: com.pictach.app
+          BASE=$(echo "$OLD" | sed 's/com\.android\.//' | cut -d'.' -f1)
+          NEW="com.${BASE}.app"
+
+          # Validate format
+          if ! echo "$NEW" | grep -qP '^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*){2,}$'; then
+            echo "::error::Generated package name '$NEW' is invalid."
+            exit 1
+          fi
+
+          echo "New package name: $NEW"
+          echo "new_package=$NEW" >> $GITHUB_OUTPUT
+
+      # ── 6. Rename package in all source files ──────────────────────────────
+      - name: Rename package in all files
+        run: |
+          OLD="${{ steps.detect.outputs.old_package }}"
+          NEW="${{ steps.generate.outputs.new_package }}"
+
+          echo "Renaming: $OLD → $NEW"
+
+          # ── Text replacements in source/config files ──────────────────────
+          find . \
+            -type f \
+            \( -name "*.gradle" -o -name "*.gradle.kts" \
+               -o -name "*.xml"  -o -name "*.kt" \
+               -o -name "*.java" -o -name "*.json" \
+               -o -name "*.properties" -o -name "*.pro" \) \
+            ! -path '*/.git/*' \
+            ! -path '*/build/*' \
+            -exec sed -i "s|${OLD}|${NEW}|g" {} +
+
+          # ── FileProvider authority rename ─────────────────────────────────
+          # e.g. com.android.pictach.verapp.provider → com.pictach.app.verapp.provider
+          OLD_AUTHORITY="${OLD}.verapp.provider"
+          NEW_AUTHORITY="${NEW}.verapp.provider"
+          find . \
+            -type f \
+            \( -name "*.xml" -o -name "*.gradle" -o -name "*.gradle.kts" \) \
+            ! -path '*/.git/*' \
+            ! -path '*/build/*' \
+            -exec sed -i "s|${OLD_AUTHORITY}|${NEW_AUTHORITY}|g" {} +
+
+          # ── Directory rename (Java/Kotlin source tree) ────────────────────
+          OLD_PATH="${OLD//.//}"
+          NEW_PATH="${NEW//.//}"
+
+          for BASE_DIR in \
+            app/src/main/java \
+            app/src/test/java \
+            app/src/androidTest/java; do
+            SRC="$BASE_DIR/$OLD_PATH"
+            DST="$BASE_DIR/$NEW_PATH"
+            if [ -d "$SRC" ]; then
+              mkdir -p "$(dirname "$DST")"
+              cp -r "$SRC" "$DST"
+              # Remove old top-level package dir only
+              OLD_TOP=$(echo "$OLD_PATH" | cut -d'/' -f1)
+              rm -rf "$BASE_DIR/$OLD_TOP"
+              echo "Moved: $SRC → $DST"
+            fi
+          done
+
+      # ── 7. Verify rename applied ────────────────────────────────────────────
+      - name: Verify package rename
+        run: |
+          NEW="${{ steps.generate.outputs.new_package }}"
+          OLD="${{ steps.detect.outputs.old_package }}"
+
+          # New name must be present in build.gradle or manifest
+          if ! grep -rq "$NEW" app/build.gradle app/build.gradle.kts \
+                                app/src/main/AndroidManifest.xml 2>/dev/null; then
+            echo "::error::New package '$NEW' not found after rename."
+            exit 1
+          fi
+
+          # Old name must NOT remain in build.gradle or manifest
+          if grep -rq "$OLD" app/build.gradle app/build.gradle.kts \
+                              app/src/main/AndroidManifest.xml 2>/dev/null; then
+            echo "::error::Old package '$OLD' still present after rename."
+            exit 1
+          fi
+
+          echo "✅ Package rename verified: $OLD → $NEW"
+
+      # ── 8. Build debug APK ─────────────────────────────────────────────────
+      - name: Grant Gradle execute permission
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace 2>&1 | tee build_output.log
+
+      # ── 9. Upload APK on success ───────────────────────────────────────────
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renamed-debug-apk-${{ steps.generate.outputs.new_package }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
+
+      # ── 10. Collect all error info on failure ──────────────────────────────
+      - name: Collect error logs
+        if: failure()
+        run: |
+          mkdir -p error_logs
+
+          # Build log
+          [ -f build_output.log ] && cp build_output.log error_logs/
+
+          # Gradle reports
+          find . -path '*/build/reports' -type d ! -path '*/.git/*' \
+            -exec cp -r {} error_logs/ \; 2>/dev/null || true
+
+          # Any .log files
+          find . -name '*.log' ! -path '*/.git/*' ! -path '*/error_logs/*' \
+            -exec cp {} error_logs/ \; 2>/dev/null || true
+
+          # Environment info
+          {
+            echo "=== JAVA VERSION ==="
+            java -version 2>&1
+            echo "=== GRADLE VERSION ==="
+            ./gradlew --version 2>&1 || true
+            echo "=== OLD PACKAGE ==="
+            echo "${{ steps.detect.outputs.old_package }}"
+            echo "=== NEW PACKAGE ==="
+            echo "${{ steps.generate.outputs.new_package }}"
+            echo "=== RENAMED FILES ==="
+            git diff --name-only 2>/dev/null || true
+          } >> error_logs/env_info.txt
+
+          zip -r error_logs.zip error_logs/
+          echo "Error zip ready."
+
+      # ── 11. Upload error zip on failure ────────────────────────────────────
+      - name: Upload error logs artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-logs
+          path: error_logs.zip
+          retention-days: 7
