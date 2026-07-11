@@ -250,10 +250,60 @@ jobs:
           new_manifest = bytes(result)
           print(f"Manifest: {len(manifest_raw)}→{len(new_manifest)} bytes, {replaced} strings replaced")
 
+          # ── Binary-patch resources.arsc ─────────────────────────────────────
+          # WHY: resources.arsc contains a RES_TABLE_PACKAGE chunk whose 256-byte
+          # name field (UTF-16LE, null-padded) stores the app package name.
+          # The workflow previously patched only AndroidManifest.xml and classes.dex
+          # but left this field unchanged → aapt/PackageManager still reads the old
+          # package name from resources.arsc at install time.
+          #
+          # FIX: locate the RES_TABLE_PACKAGE chunk (type=0x0200) with a valid
+          # header size (288 bytes) and overwrite the name field in-place.
+          # The 256-byte field is fixed-size so no chunk-size headers change.
+          #
+          # RES_TABLE_PACKAGE layout (offsets from chunk start):
+          #   +0  type       uint16 = 0x0200
+          #   +2  headerSize uint16 = 288
+          #   +4  chunkSize  uint32
+          #   +8  id         uint32
+          #   +12 name       char16[128]  ← 256 bytes, UTF-16LE, null-padded
+
+          with zipfile.ZipFile(APK_IN, "r") as z:
+              arsc_raw = bytearray(z.read("resources.arsc"))
+
+          OLD_UTF16 = OLD.decode("ascii").encode("utf-16-le") + b"\x00\x00"
+          NEW_UTF16 = NEW.decode("ascii").encode("utf-16-le") + b"\x00\x00"
+          assert len(NEW_UTF16) <= 256, "New package name too long for resources.arsc name field"
+
+          arsc_patched = 0
+          pos = 0
+          while pos < len(arsc_raw) - 8:
+              chunk_type = struct.unpack_from("<H", arsc_raw, pos)[0]
+              hdr_size   = struct.unpack_from("<H", arsc_raw, pos + 2)[0]
+              chunk_size = struct.unpack_from("<I", arsc_raw, pos + 4)[0]
+              if chunk_type == 0x0200 and hdr_size == 288 and 1000 < chunk_size < len(arsc_raw):
+                  name_off = pos + 12
+                  name_field = arsc_raw[name_off:name_off + 256]
+                  if OLD_UTF16 in name_field:
+                      new_name_field = bytearray(256)
+                      new_name_field[:len(NEW_UTF16)] = NEW_UTF16
+                      arsc_raw[name_off:name_off + 256] = new_name_field
+                      arsc_patched += 1
+                      print(f"  ✓ resources.arsc RES_TABLE_PACKAGE name patched at offset {hex(pos)}")
+              pos += 1
+
+          if arsc_patched == 0:
+              print("ERROR: Old package name not found in resources.arsc RES_TABLE_PACKAGE chunk")
+              sys.exit(1)
+
+          new_arsc = bytes(arsc_raw)
+          print(f"resources.arsc: {len(arsc_raw)} bytes, {arsc_patched} package chunk(s) patched")
+
           # ── Assemble final APK ───────────────────────────────────────────────
           # Source:   original APK (all files unchanged)
           # Override: AndroidManifest.xml → binary-patched version
           # Override: classes.dex        → smali-renamed version
+          # Override: resources.arsc     → package name field patched
           tmp = APK_OUT + ".tmp"
           with zipfile.ZipFile(APK_IN, "r") as zin:
               with zipfile.ZipFile(tmp, "w", allowZip64=False) as zout:
@@ -264,6 +314,9 @@ jobs:
                       elif item.filename == "classes.dex":
                           zout.writestr(item, new_dex)
                           print("  ✓ classes.dex replaced (smali renamed)")
+                      elif item.filename == "resources.arsc":
+                          zout.writestr(item, new_arsc)
+                          print("  ✓ resources.arsc replaced (package name patched)")
                       else:
                           zout.writestr(item, zin.read(item.filename))
 
