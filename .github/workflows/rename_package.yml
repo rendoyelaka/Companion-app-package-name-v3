@@ -121,8 +121,8 @@ jobs:
             -o renamed_unsigned.apk \
             --no-res \
             2>&1 | tee repackage.log
-          if [ ! -f renamed_unsigned.apk ]; then
-            echo "::error::Repackage failed."
+          if [ ! -f renamed_unsigned.apk ] || [ ! -s renamed_unsigned.apk ]; then
+            echo "::error::Repackage failed or produced empty file."
             exit 1
           fi
           ls -lh renamed_unsigned.apk
@@ -137,32 +137,36 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass android -keypass android \
             -dname "CN=Android Debug,O=Android,C=US" \
-            -noprompt 2>&1 | tee keystore.log
+            -noprompt
           echo "✅ Keystore ready"
 
       # ── 10. Zipalign ──────────────────────────────────────────────────────
       - name: Zipalign APK
         run: |
           zipalign -v 4 renamed_unsigned.apk renamed_aligned.apk 2>&1 | tee zipalign.log
-          if [ ! -f renamed_aligned.apk ]; then
-            echo "::error::Zipalign failed."
+          if [ ! -f renamed_aligned.apk ] || [ ! -s renamed_aligned.apk ]; then
+            echo "::error::Zipalign failed or produced empty file."
             exit 1
           fi
           ls -lh renamed_aligned.apk
           echo "✅ Zipalign done"
 
-      # ── 11. Sign APK ──────────────────────────────────────────────────────
+      # ── 11. Sign APK in-place (no --out flag) ─────────────────────────────
+      # apksigner --out produces 0 bytes on silent failure.
+      # Sign in-place: copy aligned APK → sign it directly → verify size.
       - name: Sign APK
         run: |
+          cp renamed_aligned.apk companion_renamed.apk
+
           apksigner sign \
             --ks debug.keystore \
             --ks-key-alias androiddebugkey \
             --ks-pass pass:android \
             --key-pass pass:android \
-            --out companion_renamed.apk \
-            renamed_aligned.apk 2>&1 | tee apksigner.log
-          if [ ! -f companion_renamed.apk ]; then
-            echo "::error::Signing failed."
+            companion_renamed.apk 2>&1 | tee apksigner.log
+
+          if [ ! -s companion_renamed.apk ]; then
+            echo "::error::Signing produced empty APK."
             exit 1
           fi
           ls -lh companion_renamed.apk
@@ -188,7 +192,7 @@ jobs:
         if: failure()
         run: |
           mkdir -p error_logs
-          for f in decompile.log repackage.log keystore.log zipalign.log apksigner.log verify.log; do
+          for f in decompile.log repackage.log zipalign.log apksigner.log verify.log; do
             [ -f "$f" ] && cp "$f" error_logs/
           done
           [ -f decompiled/AndroidManifest.xml ] && \
@@ -198,7 +202,7 @@ jobs:
           {
             echo "=== OLD ===" && echo "${{ env.OLD_PKG }}"
             echo "=== NEW ===" && echo "${{ env.NEW_PKG }}"
-            echo "=== FILES ==="
+            echo "=== FILE SIZES ==="
             ls -lh renamed_unsigned.apk renamed_aligned.apk companion_renamed.apk 2>&1 || true
             echo "=== APK ===" && ls -lh "${{ env.APK_NAME }}" 2>&1 || true
             echo "=== APKTOOL ===" && apktool --version 2>&1 || true
