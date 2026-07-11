@@ -1,4 +1,4 @@
-name: Decompile, Rename & Repackage APK
+name: Rename APK Package (Binary AXML Patch)
 
 on:
   push:
@@ -25,15 +25,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y zipalign apksigner aapt
-
-          APKTOOL_VER="2.9.3"
-          wget -q "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VER}/apktool_${APKTOOL_VER}.jar" \
-               -O /usr/local/bin/apktool.jar
-          wget -q "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" \
-               -O /usr/local/bin/apktool
-          chmod +x /usr/local/bin/apktool
-          apktool --version
+          sudo apt-get install -y zipalign apksigner
 
       # ── 3. Verify APK exists ───────────────────────────────────────────────
       - name: Verify APK exists
@@ -44,91 +36,148 @@ jobs:
           fi
           ls -lh "${{ env.APK_NAME }}"
 
-      # ── 4. Extract APK metadata ────────────────────────────────────────────
-      - name: Extract APK metadata
-        id: meta
+      # ── 4. Binary-patch AndroidManifest.xml + repack APK ──────────────────
+      # This approach patches the binary AXML manifest directly (no apktool).
+      # Reason: apktool repackage corrupts the binary manifest header when using
+      # --no-res, producing an invalid AXML chunk size (the root cause of the
+      # "Bad XML block" error and missing install button in the previous build).
+      - name: Patch manifest and repack APK
         run: |
-          INFO=$(aapt dump badging "${{ env.APK_NAME }}" 2>/dev/null | head -5)
-          echo "$INFO"
-          MIN_SDK=$(echo "$INFO" | grep -oP "(?<=minSdkVersion:')[0-9]+" || echo "28")
-          TGT_SDK=$(echo "$INFO" | grep -oP "(?<=targetSdkVersion:')[0-9]+" || echo "33")
-          VER_CODE=$(echo "$INFO" | grep -oP "(?<=versionCode=')[0-9]+" || echo "1")
-          VER_NAME=$(echo "$INFO" | grep -oP "(?<=versionName=')[^']+" || echo "1.0")
-          echo "min_sdk=$MIN_SDK"   >> $GITHUB_OUTPUT
-          echo "tgt_sdk=$TGT_SDK"   >> $GITHUB_OUTPUT
-          echo "ver_code=$VER_CODE" >> $GITHUB_OUTPUT
-          echo "ver_name=$VER_NAME" >> $GITHUB_OUTPUT
-          echo "✅ min=$MIN_SDK target=$TGT_SDK code=$VER_CODE name=$VER_NAME"
+          python3 << 'PYEOF'
+          import zipfile, struct, os, sys
 
-      # ── 5. Decompile APK ───────────────────────────────────────────────────
-      - name: Decompile APK
-        run: |
-          apktool d "${{ env.APK_NAME }}" \
-            -o decompiled \
-            --no-res \
-            --keep-broken-res \
-            2>&1 | tee decompile.log
-          echo "✅ Decompile done"
+          APK_IN  = "${{ env.APK_NAME }}"
+          APK_OUT = "renamed_unsigned.apk"
+          OLD     = b"${{ env.OLD_PKG }}"
+          NEW     = b"${{ env.NEW_PKG }}"
+          DELTA   = len(NEW) - len(OLD)
 
-      # ── 6. Rename package ──────────────────────────────────────────────────
-      - name: Rename package
-        run: |
-          OLD="${{ env.OLD_PKG }}"
-          NEW="${{ env.NEW_PKG }}"
-          sed -i "s|${OLD}|${NEW}|g" decompiled/AndroidManifest.xml
-          sed -i "s|${OLD}\.verapp\.provider|${NEW}.verapp.provider|g" \
-            decompiled/AndroidManifest.xml
-          find decompiled/ -name "*.smali" \
-            -exec sed -i "s|${OLD//.//}|${NEW//.//}|g" {} +
-          grep -q "$NEW" decompiled/AndroidManifest.xml || \
-            { echo "::error::New package not found."; exit 1; }
-          grep -q "$OLD" decompiled/AndroidManifest.xml && \
-            { echo "::error::Old package still present."; exit 1; }
-          echo "✅ Rename verified"
+          # ── Read original APK ──────────────────────────────────────────────
+          with zipfile.ZipFile(APK_IN, "r") as zin:
+              manifest_raw = zin.read("AndroidManifest.xml")
 
-      # ── 7. Restore apktool.yml ─────────────────────────────────────────────
-      - name: Restore apktool.yml
-        run: |
-          cat > decompiled/apktool.yml << EOF
-          version: 2.9.3
-          apkFileName: ${{ env.APK_NAME }}
-          isFrameworkApk: false
-          usesFramework:
-            ids:
-            - 1
-            tag: null
-          sdkInfo:
-            minSdkVersion: '${{ steps.meta.outputs.min_sdk }}'
-            targetSdkVersion: '${{ steps.meta.outputs.tgt_sdk }}'
-          packageInfo:
-            forcedPackageId: '127'
-            renameManifestPackage: '${{ env.NEW_PKG }}'
-          versionInfo:
-            versionCode: '${{ steps.meta.outputs.ver_code }}'
-            versionName: '${{ steps.meta.outputs.ver_name }}'
-          resourcesAreCompressed: false
-          sharedLibrary: false
-          sparseResources: false
-          doNotCompress:
-          - resources.arsc
-          EOF
-          echo "✅ apktool.yml restored"
+          print(f"Original manifest size: {len(manifest_raw)} bytes")
+          print(f"OLD occurrences (raw): {manifest_raw.count(OLD)}")
 
-      # ── 8. Repackage ──────────────────────────────────────────────────────
-      - name: Repackage APK
-        run: |
-          apktool b decompiled \
-            -o renamed_unsigned.apk \
-            --no-res \
-            2>&1 | tee repackage.log
+          # ── Parse AXML string pool ─────────────────────────────────────────
+          # File layout:
+          #   [0:4]   magic (0x00080003)
+          #   [4:8]   fileSize
+          #   [8:12]  SP chunk type (0x001C0001)
+          #   [12:16] SP chunk size
+          #   [16:20] stringCount
+          #   [20:24] styleCount
+          #   [24:28] flags  (0x100 = UTF-8)
+          #   [28:32] stringsStart (relative to SP chunk start = offset 8)
+          #   [32:36] stylesStart
+          #   [36 : 36+stringCount*4]  string offset table
+          #   [8+stringsStart : ...]   string data
+          #   UTF-8 string entry: charcount(1) + bytecount(1) + chars(bytecount) + null(1)
+
+          SP = 8
+          sp_size     = struct.unpack_from("<I", manifest_raw, SP + 4)[0]
+          str_count   = struct.unpack_from("<I", manifest_raw, SP + 8)[0]
+          strs_start  = struct.unpack_from("<I", manifest_raw, SP + 20)[0]
+          str_data_abs = SP + strs_start
+          offsets_abs  = SP + 28   # offset table starts right after 7-field SP header
+
+          sp_end = SP + sp_size
+          xml_tree = manifest_raw[sp_end:]   # XML tree chunk — never modified
+
+          print(f"SP: strCount={str_count}, stringsStart={strs_start}, SP ends at {sp_end}")
+
+          # ── Read all string entries ────────────────────────────────────────
+          entries = []
+          for i in range(str_count):
+              off = struct.unpack_from("<I", manifest_raw, offsets_abs + i * 4)[0]
+              pos = str_data_abs + off
+              cc  = manifest_raw[pos]
+              bc  = manifest_raw[pos + 1]
+              ch  = manifest_raw[pos + 2 : pos + 2 + bc]
+              assert manifest_raw[pos + 2 + bc] == 0, f"String {i} missing null terminator"
+              entries.append((cc, bc, ch))
+
+          # ── Rebuild string data with replacements ──────────────────────────
+          new_str_data = bytearray()
+          new_offsets  = []
+          replaced     = 0
+
+          for (cc, bc, ch) in entries:
+              new_offsets.append(len(new_str_data))
+              if OLD in ch:
+                  new_ch  = ch.replace(OLD, NEW)
+                  new_bc  = bc + DELTA
+                  new_cc  = cc + DELTA
+                  new_str_data.append(new_cc)
+                  new_str_data.append(new_bc)
+                  new_str_data.extend(new_ch)
+                  new_str_data.append(0)
+                  replaced += 1
+              else:
+                  new_str_data.append(cc)
+                  new_str_data.append(bc)
+                  new_str_data.extend(ch)
+                  new_str_data.append(0)
+
+          print(f"Strings replaced: {replaced}")
+          if replaced == 0:
+              print("ERROR: No strings replaced — OLD package not found in manifest string pool")
+              sys.exit(1)
+
+          # ── Assemble patched manifest ──────────────────────────────────────
+          new_sp_size = 28 + str_count * 4 + len(new_str_data)
+          result      = bytearray()
+
+          result.extend(manifest_raw[0:8])             # file header magic + filesize placeholder
+          result.extend(manifest_raw[SP : SP + 28])    # SP chunk header (7 fields)
+
+          for off in new_offsets:                      # new offset table
+              result.extend(struct.pack("<I", off))
+
+          result.extend(new_str_data)                  # new string data
+          result.extend(xml_tree)                      # XML tree unchanged
+
+          # Fix file size and SP chunk size
+          struct.pack_into("<I", result, 4,       len(result))
+          struct.pack_into("<I", result, SP + 4,  new_sp_size)
+
+          print(f"Patched manifest size: {len(result)} bytes")
+
+          # ── Verify ────────────────────────────────────────────────────────
+          patched_bytes = bytes(result)
+          if OLD in patched_bytes:
+              # Check if old pkg still in string pool (not just in XML tree refs)
+              sp_end_new = SP + new_sp_size
+              if OLD in patched_bytes[:sp_end_new]:
+                  print("ERROR: OLD package still present in patched string pool")
+                  sys.exit(1)
+          if NEW not in patched_bytes:
+              print("ERROR: NEW package not found in patched manifest")
+              sys.exit(1)
+
+          # ── Repack APK (preserving original compression types) ─────────────
+          tmp_apk = APK_OUT + ".tmp"
+          with zipfile.ZipFile(APK_IN, "r") as zin:
+              with zipfile.ZipFile(tmp_apk, "w", allowZip64=False) as zout:
+                  for item in zin.infolist():
+                      if item.filename == "AndroidManifest.xml":
+                          zout.writestr(item, bytes(result))
+                          print(f"  Replaced: AndroidManifest.xml")
+                      else:
+                          zout.writestr(item, zin.read(item.filename))
+
+          os.replace(tmp_apk, APK_OUT)
+          print(f"Repacked APK: {APK_OUT} ({os.path.getsize(APK_OUT)} bytes)")
+          PYEOF
+
           if [ ! -f renamed_unsigned.apk ] || [ ! -s renamed_unsigned.apk ]; then
-            echo "::error::Repackage failed or produced empty file."
+            echo "::error::Patch/repack failed or produced empty file."
             exit 1
           fi
           ls -lh renamed_unsigned.apk
-          echo "✅ Repackage done"
+          echo "✅ Manifest patched and APK repacked"
 
-      # ── 9. Generate debug keystore ─────────────────────────────────────────
+      # ── 5. Generate debug keystore ─────────────────────────────────────────
       - name: Generate debug keystore
         run: |
           keytool -genkeypair \
@@ -140,7 +189,7 @@ jobs:
             -noprompt
           echo "✅ Keystore ready"
 
-      # ── 10. Zipalign ──────────────────────────────────────────────────────
+      # ── 6. Zipalign ───────────────────────────────────────────────────────
       - name: Zipalign APK
         run: |
           zipalign -v 4 renamed_unsigned.apk renamed_aligned.apk 2>&1 | tee zipalign.log
@@ -151,20 +200,17 @@ jobs:
           ls -lh renamed_aligned.apk
           echo "✅ Zipalign done"
 
-      # ── 11. Sign APK in-place (no --out flag) ─────────────────────────────
-      # apksigner --out produces 0 bytes on silent failure.
-      # Sign in-place: copy aligned APK → sign it directly → verify size.
+      # ── 7. Sign APK in-place (no --out flag) ──────────────────────────────
+      # apksigner --out produces 0 bytes on silent failure; sign in-place to catch this.
       - name: Sign APK
         run: |
           cp renamed_aligned.apk companion_renamed.apk
-
           apksigner sign \
             --ks debug.keystore \
             --ks-key-alias androiddebugkey \
             --ks-pass pass:android \
             --key-pass pass:android \
             companion_renamed.apk 2>&1 | tee apksigner.log
-
           if [ ! -s companion_renamed.apk ]; then
             echo "::error::Signing produced empty APK."
             exit 1
@@ -172,13 +218,13 @@ jobs:
           ls -lh companion_renamed.apk
           echo "✅ APK signed"
 
-      # ── 12. Verify signature ──────────────────────────────────────────────
+      # ── 8. Verify signature ───────────────────────────────────────────────
       - name: Verify APK signature
         run: |
           apksigner verify --verbose companion_renamed.apk 2>&1 | tee verify.log
           echo "✅ Signature verified"
 
-      # ── 13. Upload APK ────────────────────────────────────────────────────
+      # ── 9. Upload APK ─────────────────────────────────────────────────────
       - name: Upload renamed APK
         if: success()
         uses: actions/upload-artifact@v4
@@ -187,30 +233,25 @@ jobs:
           path: companion_renamed.apk
           retention-days: 7
 
-      # ── 14. Collect ALL logs on failure ───────────────────────────────────
+      # ── 10. Collect error logs on failure ─────────────────────────────────
       - name: Collect error logs
         if: failure()
         run: |
           mkdir -p error_logs
-          for f in decompile.log repackage.log zipalign.log apksigner.log verify.log; do
+          for f in zipalign.log apksigner.log verify.log; do
             [ -f "$f" ] && cp "$f" error_logs/
           done
-          [ -f decompiled/AndroidManifest.xml ] && \
-            cp decompiled/AndroidManifest.xml error_logs/
-          [ -f decompiled/apktool.yml ] && \
-            cp decompiled/apktool.yml error_logs/
           {
             echo "=== OLD ===" && echo "${{ env.OLD_PKG }}"
             echo "=== NEW ===" && echo "${{ env.NEW_PKG }}"
             echo "=== FILE SIZES ==="
             ls -lh renamed_unsigned.apk renamed_aligned.apk companion_renamed.apk 2>&1 || true
             echo "=== APK ===" && ls -lh "${{ env.APK_NAME }}" 2>&1 || true
-            echo "=== APKTOOL ===" && apktool --version 2>&1 || true
             echo "=== JAVA ===" && java -version 2>&1 || true
           } >> error_logs/env_info.txt
           zip -r error_logs.zip error_logs/
 
-      # ── 15. Upload error zip ──────────────────────────────────────────────
+      # ── 11. Upload error zip ──────────────────────────────────────────────
       - name: Upload error logs
         if: failure()
         uses: actions/upload-artifact@v4
