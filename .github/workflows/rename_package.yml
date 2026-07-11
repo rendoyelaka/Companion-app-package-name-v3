@@ -21,11 +21,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Install dependencies ────────────────────────────────────────────
+      # ── 2. Install tools ───────────────────────────────────────────────────
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y zipalign apksigner
+          sudo apt-get install -y zipalign apksigner aapt
 
           APKTOOL_VER="2.9.3"
           wget -q "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VER}/apktool_${APKTOOL_VER}.jar" \
@@ -39,44 +39,44 @@ jobs:
       - name: Verify APK exists
         run: |
           if [ ! -f "${{ env.APK_NAME }}" ]; then
-            echo "::error::${{ env.APK_NAME }} not found in repository root."
+            echo "::error::${{ env.APK_NAME }} not found in repo root."
             exit 1
           fi
           echo "✅ Found: ${{ env.APK_NAME }}"
 
-      # ── 4. Decompile APK ───────────────────────────────────────────────────
-      # --keep-broken-res: keeps broken/undecodable resources instead of failing
-      # --no-src: skip smali disassembly (we only need resources + manifest)
+      # ── 4. Decompile APK (manifest + smali only, skip broken resources) ────
       - name: Decompile APK
         run: |
           apktool d "${{ env.APK_NAME }}" \
             -o decompiled \
-            --no-src \
+            --no-res \
             --keep-broken-res \
             2>&1 | tee decompile.log
           echo "✅ Decompile done"
+          ls decompiled/
 
-      # ── 5. Rename package in all decompiled files ──────────────────────────
-      - name: Rename package name
+      # ── 5. Rename package in manifest and smali ────────────────────────────
+      - name: Rename package
         run: |
           OLD="${{ env.OLD_PKG }}"
           NEW="${{ env.NEW_PKG }}"
 
           echo "Renaming: $OLD → $NEW"
 
-          # Replace in all text files
-          find decompiled/ -type f \
-            \( -name "*.xml" -o -name "*.smali" \
-               -o -name "*.properties" -o -name "*.json" \
-               -o -name "*.txt" \) \
-            -exec sed -i "s|${OLD}|${NEW}|g" {} +
+          # Manifest
+          sed -i "s|${OLD}|${NEW}|g" decompiled/AndroidManifest.xml
 
-          # Rename in apktool.yml
-          sed -i "s|${OLD}|${NEW}|g" decompiled/apktool.yml
+          # smali files (if any)
+          find decompiled/ -name "*.smali" \
+            -exec sed -i "s|${OLD//.//}|${NEW//.//}|g" {} +
 
-          # Fix FileProvider authority
-          find decompiled/ -type f -name "*.xml" \
-            -exec sed -i "s|${OLD}\.verapp\.provider|${NEW}.verapp.provider|g" {} +
+          # apktool.yml renameManifestPackage
+          sed -i "s|renameManifestPackage: null|renameManifestPackage: '${NEW}'|g" \
+            decompiled/apktool.yml
+
+          # FileProvider authority
+          sed -i "s|${OLD}\.verapp\.provider|${NEW}.verapp.provider|g" \
+            decompiled/AndroidManifest.xml
 
           echo "✅ Rename done"
 
@@ -89,30 +89,14 @@ jobs:
             echo "::error::Old package still present in AndroidManifest.xml."
             exit 1
           fi
-          echo "✅ Package verified"
+          echo "✅ Verified: $NEW"
 
-      # ── 6. Fix broken mipmap reference ────────────────────────────────────
-      # The app icon mipmaps failed to decode → mipmaps.xml holds a broken
-      # reference → remove it so aapt does not fail on repackage
-      - name: Fix broken mipmap reference
-        run: |
-          MIPMAP_XML="decompiled/res/values-anydpi-v26/mipmaps.xml"
-          if [ -f "$MIPMAP_XML" ]; then
-            # Remove lines referencing mipmap entries that decoded as FALSE
-            sed -i '/mipmap0001\|mipmap0002\|mipmap0005/d' "$MIPMAP_XML"
-            echo "✅ Cleaned broken mipmap references"
-          else
-            echo "No mipmaps.xml found — skipping"
-          fi
-
-      # ── 7. Repackage with aapt1 ────────────────────────────────────────────
-      # --use-aapt1: avoids aapt2 strict path validation that rejects
-      #              apktool's 'type1' resource folder naming
+      # ── 6. Repackage (no resource recompile — use original resources.arsc) ─
       - name: Repackage APK
         run: |
           apktool b decompiled \
             -o renamed_unsigned.apk \
-            --use-aapt1 \
+            --no-res \
             2>&1 | tee repackage.log
 
           if [ ! -f renamed_unsigned.apk ]; then
@@ -120,29 +104,27 @@ jobs:
             exit 1
           fi
           echo "✅ Repackage done"
+          ls -lh renamed_unsigned.apk
 
-      # ── 8. Generate debug keystore ─────────────────────────────────────────
+      # ── 7. Generate debug keystore ─────────────────────────────────────────
       - name: Generate debug keystore
         run: |
           keytool -genkeypair \
             -keystore debug.keystore \
             -alias androiddebugkey \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass android \
-            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
             -dname "CN=Android Debug,O=Android,C=US" \
             -noprompt
-          echo "✅ Keystore generated"
+          echo "✅ Keystore ready"
 
-      # ── 9. Zipalign ────────────────────────────────────────────────────────
+      # ── 8. Zipalign ────────────────────────────────────────────────────────
       - name: Zipalign APK
         run: |
           zipalign -v 4 renamed_unsigned.apk renamed_aligned.apk
           echo "✅ Zipalign done"
 
-      # ── 10. Sign APK ───────────────────────────────────────────────────────
+      # ── 9. Sign APK ────────────────────────────────────────────────────────
       - name: Sign APK
         run: |
           apksigner sign \
@@ -155,13 +137,13 @@ jobs:
           echo "✅ APK signed"
           ls -lh companion_renamed.apk
 
-      # ── 11. Verify signed APK ──────────────────────────────────────────────
+      # ── 10. Verify signature ───────────────────────────────────────────────
       - name: Verify APK signature
         run: |
           apksigner verify --verbose companion_renamed.apk
           echo "✅ Signature verified"
 
-      # ── 12. Upload APK artifact ────────────────────────────────────────────
+      # ── 11. Upload APK ─────────────────────────────────────────────────────
       - name: Upload renamed APK
         if: success()
         uses: actions/upload-artifact@v4
@@ -170,30 +152,27 @@ jobs:
           path: companion_renamed.apk
           retention-days: 7
 
-      # ── 13. Collect error logs on failure ──────────────────────────────────
+      # ── 12. Collect error logs on failure ──────────────────────────────────
       - name: Collect error logs
         if: failure()
         run: |
           mkdir -p error_logs
-
           [ -f decompile.log ]  && cp decompile.log  error_logs/
           [ -f repackage.log ]  && cp repackage.log  error_logs/
           [ -f decompiled/AndroidManifest.xml ] && \
             cp decompiled/AndroidManifest.xml error_logs/
           [ -f decompiled/apktool.yml ] && \
             cp decompiled/apktool.yml error_logs/
-
           {
-            echo "=== OLD PACKAGE ===" && echo "${{ env.OLD_PKG }}"
-            echo "=== NEW PACKAGE ===" && echo "${{ env.NEW_PKG }}"
+            echo "=== OLD ===" && echo "${{ env.OLD_PKG }}"
+            echo "=== NEW ===" && echo "${{ env.NEW_PKG }}"
             echo "=== APK ===" && ls -lh "${{ env.APK_NAME }}" 2>&1 || true
             echo "=== APKTOOL ===" && apktool --version 2>&1 || true
             echo "=== JAVA ===" && java -version 2>&1 || true
           } >> error_logs/env_info.txt
-
           zip -r error_logs.zip error_logs/
 
-      # ── 14. Upload error zip on failure ────────────────────────────────────
+      # ── 13. Upload error zip ───────────────────────────────────────────────
       - name: Upload error logs
         if: failure()
         uses: actions/upload-artifact@v4
