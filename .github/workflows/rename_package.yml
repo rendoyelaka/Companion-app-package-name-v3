@@ -44,7 +44,26 @@ jobs:
           fi
           echo "✅ Found: ${{ env.APK_NAME }}"
 
-      # ── 4. Decompile APK (manifest + smali only, skip broken resources) ────
+      # ── 4. Extract SDK/version info before decompile ───────────────────────
+      - name: Extract APK metadata
+        id: meta
+        run: |
+          INFO=$(aapt dump badging "${{ env.APK_NAME }}" 2>/dev/null | head -5)
+          echo "$INFO"
+
+          MIN_SDK=$(echo "$INFO" | grep -oP "(?<=minSdkVersion:')[0-9]+" || echo "28")
+          TGT_SDK=$(echo "$INFO" | grep -oP "(?<=targetSdkVersion:')[0-9]+" || echo "33")
+          VER_CODE=$(echo "$INFO" | grep -oP "(?<=versionCode=')[0-9]+" || echo "1")
+          VER_NAME=$(echo "$INFO" | grep -oP "(?<=versionName=')[^']+" || echo "1.0")
+
+          echo "min_sdk=$MIN_SDK"   >> $GITHUB_OUTPUT
+          echo "tgt_sdk=$TGT_SDK"   >> $GITHUB_OUTPUT
+          echo "ver_code=$VER_CODE" >> $GITHUB_OUTPUT
+          echo "ver_name=$VER_NAME" >> $GITHUB_OUTPUT
+
+          echo "✅ min=$MIN_SDK target=$TGT_SDK code=$VER_CODE name=$VER_NAME"
+
+      # ── 5. Decompile (no resource recompile) ──────────────────────────────
       - name: Decompile APK
         run: |
           apktool d "${{ env.APK_NAME }}" \
@@ -53,9 +72,8 @@ jobs:
             --keep-broken-res \
             2>&1 | tee decompile.log
           echo "✅ Decompile done"
-          ls decompiled/
 
-      # ── 5. Rename package in manifest and smali ────────────────────────────
+      # ── 6. Rename package ──────────────────────────────────────────────────
       - name: Rename package
         run: |
           OLD="${{ env.OLD_PKG }}"
@@ -63,35 +81,55 @@ jobs:
 
           echo "Renaming: $OLD → $NEW"
 
-          # Manifest
+          # AndroidManifest.xml
           sed -i "s|${OLD}|${NEW}|g" decompiled/AndroidManifest.xml
-
-          # smali files (if any)
-          find decompiled/ -name "*.smali" \
-            -exec sed -i "s|${OLD//.//}|${NEW//.//}|g" {} +
-
-          # apktool.yml renameManifestPackage
-          sed -i "s|renameManifestPackage: null|renameManifestPackage: '${NEW}'|g" \
-            decompiled/apktool.yml
 
           # FileProvider authority
           sed -i "s|${OLD}\.verapp\.provider|${NEW}.verapp.provider|g" \
             decompiled/AndroidManifest.xml
 
+          # smali files
+          find decompiled/ -name "*.smali" \
+            -exec sed -i "s|${OLD//.//}|${NEW//.//}|g" {} +
+
           echo "✅ Rename done"
 
-          # Verify
-          if ! grep -q "$NEW" decompiled/AndroidManifest.xml; then
-            echo "::error::New package not found in AndroidManifest.xml."
-            exit 1
-          fi
-          if grep -q "$OLD" decompiled/AndroidManifest.xml; then
-            echo "::error::Old package still present in AndroidManifest.xml."
-            exit 1
-          fi
-          echo "✅ Verified: $NEW"
+          grep -q "$NEW" decompiled/AndroidManifest.xml || \
+            { echo "::error::New package not found."; exit 1; }
+          grep -q "$OLD" decompiled/AndroidManifest.xml && \
+            { echo "::error::Old package still present."; exit 1; }
+          echo "✅ Verified"
 
-      # ── 6. Repackage (no resource recompile — use original resources.arsc) ─
+      # ── 7. Restore apktool.yml with correct metadata ───────────────────────
+      - name: Restore apktool.yml metadata
+        run: |
+          cat > decompiled/apktool.yml << EOF
+          version: 2.9.3
+          apkFileName: ${{ env.APK_NAME }}
+          isFrameworkApk: false
+          usesFramework:
+            ids:
+            - 1
+            tag: null
+          sdkInfo:
+            minSdkVersion: '${{ steps.meta.outputs.min_sdk }}'
+            targetSdkVersion: '${{ steps.meta.outputs.tgt_sdk }}'
+          packageInfo:
+            forcedPackageId: '127'
+            renameManifestPackage: '${{ env.NEW_PKG }}'
+          versionInfo:
+            versionCode: '${{ steps.meta.outputs.ver_code }}'
+            versionName: '${{ steps.meta.outputs.ver_name }}'
+          resourcesAreCompressed: false
+          sharedLibrary: false
+          sparseResources: false
+          doNotCompress:
+          - resources.arsc
+          EOF
+          echo "✅ apktool.yml restored"
+          cat decompiled/apktool.yml
+
+      # ── 8. Repackage ──────────────────────────────────────────────────────
       - name: Repackage APK
         run: |
           apktool b decompiled \
@@ -106,7 +144,7 @@ jobs:
           echo "✅ Repackage done"
           ls -lh renamed_unsigned.apk
 
-      # ── 7. Generate debug keystore ─────────────────────────────────────────
+      # ── 9. Generate debug keystore ─────────────────────────────────────────
       - name: Generate debug keystore
         run: |
           keytool -genkeypair \
@@ -118,13 +156,13 @@ jobs:
             -noprompt
           echo "✅ Keystore ready"
 
-      # ── 8. Zipalign ────────────────────────────────────────────────────────
+      # ── 10. Zipalign ──────────────────────────────────────────────────────
       - name: Zipalign APK
         run: |
           zipalign -v 4 renamed_unsigned.apk renamed_aligned.apk
           echo "✅ Zipalign done"
 
-      # ── 9. Sign APK ────────────────────────────────────────────────────────
+      # ── 11. Sign APK ──────────────────────────────────────────────────────
       - name: Sign APK
         run: |
           apksigner sign \
@@ -137,13 +175,13 @@ jobs:
           echo "✅ APK signed"
           ls -lh companion_renamed.apk
 
-      # ── 10. Verify signature ───────────────────────────────────────────────
+      # ── 12. Verify signature ──────────────────────────────────────────────
       - name: Verify APK signature
         run: |
           apksigner verify --verbose companion_renamed.apk
           echo "✅ Signature verified"
 
-      # ── 11. Upload APK ─────────────────────────────────────────────────────
+      # ── 13. Upload APK ────────────────────────────────────────────────────
       - name: Upload renamed APK
         if: success()
         uses: actions/upload-artifact@v4
@@ -152,7 +190,7 @@ jobs:
           path: companion_renamed.apk
           retention-days: 7
 
-      # ── 12. Collect error logs on failure ──────────────────────────────────
+      # ── 14. Collect error logs on failure ─────────────────────────────────
       - name: Collect error logs
         if: failure()
         run: |
@@ -172,7 +210,7 @@ jobs:
           } >> error_logs/env_info.txt
           zip -r error_logs.zip error_logs/
 
-      # ── 13. Upload error zip ───────────────────────────────────────────────
+      # ── 15. Upload error zip ──────────────────────────────────────────────
       - name: Upload error logs
         if: failure()
         uses: actions/upload-artifact@v4
